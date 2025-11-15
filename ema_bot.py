@@ -30,6 +30,8 @@ def send_telegram_message(message):
 # === EMA CALCULATION ===
 def get_ema(candles, period=5):
     closes = [float(c[4]) for c in candles]
+    if len(closes) < period:
+        return None
     df = pd.DataFrame(closes)
     return df.ewm(span=period, adjust=False).mean().iloc[-2][0]
 
@@ -55,8 +57,11 @@ def check_signal(label, low, ema, candle_time):
             f"Low: {low}\nEMA5: {ema:.2f}"
         )
         print(f"✅ Signal detected on {label}")
-        if not DEBUG_MODE:
-            send_telegram_message(message)
+        try:
+            if not DEBUG_MODE:
+                send_telegram_message(message)
+        except Exception as e:
+            print("Telegram error:", e)
         last_signal_times[label] = candle_time
     else:
         print(f"❌ No signal on {label}")
@@ -65,44 +70,59 @@ def check_signal(label, low, ema, candle_time):
 if __name__ == "__main__":
     print("🚀 Bot started — monitoring BTCUSDT on 45m, 1h, and 4h...")
 
-    # Initialize next run times
-    now = datetime.now()
-    next_45m = now.replace(minute=(now.minute // 45) * 45, second=0, microsecond=0) + timedelta(minutes=45)
-    next_1h = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-    next_4h = now.replace(hour=(now.hour // 4) * 4, minute=0, second=0, microsecond=0) + timedelta(hours=4)
+    next_45m = datetime.now()
+    next_1h = datetime.now()
+    next_4h = datetime.now()
 
     while True:
         now = datetime.now()
 
         # --- 45m synthetic ---
         if now >= next_45m:
-            candle_45m = get_synthetic_45m_candle()
-            low_45m = candle_45m[3]
-            time_45m = datetime.fromtimestamp(candle_45m[0] / 1000)
-            candles_15m = client.get_klines(symbol=SYMBOL, interval=Client.KLINE_INTERVAL_15MINUTE, limit=50)
-            closes_45m = [float(c[4]) for c in candles_15m]
-            ema_45m = get_ema(candles_15m)
-            check_signal("45 MIN", low_45m, ema_45m, time_45m)
+            try:
+                candle_45m = get_synthetic_45m_candle()
+                low_45m = candle_45m[3]
+                time_45m = datetime.fromtimestamp(candle_45m[0] / 1000)
+                candles_15m = client.get_klines(symbol=SYMBOL, interval=Client.KLINE_INTERVAL_15MINUTE, limit=50)
+                ema_45m = get_ema(candles_15m)
+                if ema_45m:
+                    check_signal("45 MIN", low_45m, ema_45m, time_45m)
+                else:
+                    print("⚠️ EMA not calculated for 45m")
+            except Exception as e:
+                print("⚠️ 45m error:", e)
             next_45m += timedelta(minutes=45)
 
         # --- 1h ---
         if now >= next_1h:
-            candles_1h = client.get_klines(symbol=SYMBOL, interval=Client.KLINE_INTERVAL_1HOUR, limit=50)
-            latest_1h = candles_1h[-2]
-            low_1h = float(latest_1h[3])
-            time_1h = datetime.fromtimestamp(latest_1h[0] / 1000)
-            ema_1h = get_ema(candles_1h)
-            check_signal("1 HOUR", low_1h, ema_1h, time_1h)
+            try:
+                candles_1h = client.get_klines(symbol=SYMBOL, interval=Client.KLINE_INTERVAL_1HOUR, limit=50)
+                latest_1h = candles_1h[-2]
+                low_1h = float(latest_1h[3])
+                time_1h = datetime.fromtimestamp(latest_1h[0] / 1000)
+                ema_1h = get_ema(candles_1h)
+                if ema_1h:
+                    check_signal("1 HOUR", low_1h, ema_1h, time_1h)
+                else:
+                    print("⚠️ EMA not calculated for 1h")
+            except Exception as e:
+                print("⚠️ 1h error:", e)
             next_1h += timedelta(hours=1)
 
         # --- 4h ---
         if now >= next_4h:
-            candles_4h = client.get_klines(symbol=SYMBOL, interval=Client.KLINE_INTERVAL_4HOUR, limit=50)
-            latest_4h = candles_4h[-2]
-            low_4h = float(latest_4h[3])
-            time_4h = datetime.fromtimestamp(latest_4h[0] / 1000)
-            ema_4h = get_ema(candles_4h)
-            check_signal("4 HOUR", low_4h, ema_4h, time_4h)
+            try:
+                candles_4h = client.get_klines(symbol=SYMBOL, interval=Client.KLINE_INTERVAL_4HOUR, limit=50)
+                latest_4h = candles_4h[-2]
+                low_4h = float(latest_4h[3])
+                time_4h = datetime.fromtimestamp(latest_4h[0] / 1000)
+                ema_4h = get_ema(candles_4h)
+                if ema_4h:
+                    check_signal("4 HOUR", low_4h, ema_4h, time_4h)
+                else:
+                    print("⚠️ EMA not calculated for 4h")
+            except Exception as e:
+                print("⚠️ 4h error:", e)
             next_4h += timedelta(hours=4)
 
-        time.sleep(30)  # lightweight wait
+        time.sleep(30)
