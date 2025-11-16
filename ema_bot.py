@@ -1,48 +1,99 @@
 import os
-import requests
+import sys
 import time
-from datetime import datetime, timedelta
-from binance.client import Client
+from datetime import datetime, timedelta, timezone
+import requests
 import pandas as pd
+from binance.client import Client
 
 # === CONFIG ===
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-SYMBOL = 'BTCUSDT'
-DEBUG_MODE = False
+SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
+DEBUG_MODE = os.getenv("DEBUG_MODE", "False").lower() == "true"
 
 client = Client()
 last_signal_times = {}
 
+# === LOGGING ===
+def log(msg):
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    print(f"[{now}] {msg}", flush=True)
+
+def warn(msg):
+    log(f"⚠️ {msg}")
+
+def fail(msg):
+    log(f"ERROR: {msg}")
+    sys.exit(1)
+
+def assert_env():
+    missing = []
+    if not TELEGRAM_TOKEN: missing.append("TELEGRAM_TOKEN")
+    if not TELEGRAM_CHAT_ID: missing.append("TELEGRAM_CHAT_ID")
+    if missing:
+        warn(f"Missing env vars: {', '.join(missing)} (Telegram sending will fail)")
+    log(f"ENV | SYMBOL={SYMBOL} DEBUG_MODE={DEBUG_MODE}")
+
 # === TELEGRAM ALERT ===
 def send_telegram_message(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        warn("Telegram vars missing; skipping send")
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
     try:
         r = requests.post(url, json=payload, timeout=10)
         if r.status_code == 200:
-            print("📨 Telegram sent successfully")
+            log("Telegram sent")
         else:
-            print(f"❌ Telegram error ({r.status_code}): {r.text}")
+            warn(f"Telegram error ({r.status_code}): {r.text[:200]}")
     except Exception as e:
-        print("Telegram exception:", e)
+        warn(f"Telegram exception: {e}")
 
-# === EMA CALCULATION ===
-def get_ema(closes, period=5):
+# === EMA CALCULATION (aligned to last closed) ===
+def ema_last_closed(closes, period=5):
+    if len(closes) < period + 1:
+        return None
     df = pd.DataFrame(closes, columns=["close"])
-    return df.ewm(span=period, adjust=False).mean().iloc[-2][0]
+    ema_series = df["close"].ewm(span=period, adjust=False).mean()
+    # use second-last for closed candle alignment
+    return float(ema_series.iloc[-2])
 
-# === Synthetic 45m candles ===
-def get_synthetic_45m_series():
-    raw = client.get_klines(symbol=SYMBOL, interval=Client.KLINE_INTERVAL_15MINUTE, limit=200)
+# === Binance fetch helpers ===
+def fetch_klines(interval, limit=200):
+    try:
+        data = client.get_klines(symbol=SYMBOL, interval=interval, limit=limit)
+        if not data or len(data) == 0:
+            warn(f"No klines for interval {interval}")
+            return None
+        return data
+    except Exception as e:
+        warn(f"Binance get_klines error ({interval}): {e}")
+        return None
+
+# === Synthetic 45m aggregation (3×15m) ===
+def get_synthetic_45m_df():
+    raw = fetch_klines(Client.KLINE_INTERVAL_15MINUTE, limit=240)
+    if raw is None:
+        return None
     df = pd.DataFrame(raw, columns=[
         'ts','open','high','low','close','vol',
         'ct','qav','nt','tb','tq','ignore'
     ])
+    # convert types
     df['ts'] = pd.to_datetime(df['ts'], unit='ms')
-    df[['open','high','low','close']] = df[['open','high','low','close']].astype(float)
+    for col in ['open','high','low','close']:
+        df[col] = df[col].astype(float)
 
-    # group every 3×15m = 45m
+    # Ensure we only use closed candles (exclude the last if still open)
+    # Binance returns open time in 'ts' and close time in 'ct'; we take up to -1 safely
+    if len(df) < 6:  # need at least 6×15m to produce 2×45m closed
+        warn("Too few 15m candles to synthesize 45m")
+        return None
+
+    # Group 3 consecutive 15m into 45m; use integer index to avoid time gaps
+    df = df.reset_index(drop=True)
     grouped = df.groupby(df.index // 3).agg({
         'ts':'first',
         'open':'first',
@@ -51,45 +102,53 @@ def get_synthetic_45m_series():
         'close':'last'
     }).reset_index(drop=True)
 
+    if len(grouped) < 2:
+        warn("Not enough 45m synthetic candles (need at least 2 closed)")
+        return None
+
     return grouped
 
-# === SIGNAL CHECK ===
+# === Signal evaluation ===
 def check_signal(label, candle, ema):
-    low = candle['low']
-    high = candle['high']
-    candle_time = candle['ts']
-    print(f"[{datetime.now()}] [{label}] H:{high} L:{low} EMA5:{ema:.2f}")
+    if ema is None:
+        warn(f"{label}: EMA unavailable (series too short)")
+        return
 
-    # SELL
-    if low > ema and candle_time != last_signal_times.get(f"{label}_SELL"):
-        message = (
-            f"🚀 SELL Signal\n\nTIME FRAME - {label}\n"
-            f"Candle Time: {candle_time.strftime('%Y-%m-%d %H:%M')}\n"
-            f"Low: {low}\nEMA5: {ema:.2f}"
+    low = float(candle['low'])
+    high = float(candle['high'])
+    ts = candle['ts']  # pandas Timestamp
+    log(f"{label} | H:{high:.2f} L:{low:.2f} EMA5:{ema:.2f}")
+
+    # SELL: low > ema (no-touch from below), dedupe by timestamp
+    if low > ema and last_signal_times.get(f"{label}_SELL") != ts:
+        msg = (
+            f"🚀 SELL Signal\n\nTIME FRAME: {label}\n"
+            f"Candle Time: {ts.strftime('%Y-%m-%d %H:%M')}\n"
+            f"Low: {low:.2f}\nEMA5: {ema:.2f}"
         )
-        print(f"✅ SELL Signal detected on {label}")
+        log(f"{label}: SELL detected")
         if not DEBUG_MODE:
-            send_telegram_message(message)
-        last_signal_times[f"{label}_SELL"] = candle_time
+            send_telegram_message(msg)
+        last_signal_times[f"{label}_SELL"] = ts
+        return
 
-    # BUY
-    elif high < ema and candle_time != last_signal_times.get(f"{label}_BUY"):
-        message = (
-            f"🟢 BUY Signal\n\nTIME FRAME - {label}\n"
-            f"Candle Time: {candle_time.strftime('%Y-%m-%d %H:%M')}\n"
-            f"High: {high}\nEMA5: {ema:.2f}"
+    # BUY: high < ema (no-touch from above)
+    if high < ema and last_signal_times.get(f"{label}_BUY") != ts:
+        msg = (
+            f"🟢 BUY Signal\n\nTIME FRAME: {label}\n"
+            f"Candle Time: {ts.strftime('%Y-%m-%d %H:%M')}\n"
+            f"High: {high:.2f}\nEMA5: {ema:.2f}"
         )
-        print(f"✅ BUY Signal detected on {label}")
+        log(f"{label}: BUY detected")
         if not DEBUG_MODE:
-            send_telegram_message(message)
-        last_signal_times[f"{label}_BUY"] = candle_time
+            send_telegram_message(msg)
+        last_signal_times[f"{label}_BUY"] = ts
+        return
 
-    else:
-        print(f"❌ No signal on {label}")
+    log(f"{label}: No signal")
 
-# === Round scheduling ===
+# === Precise scheduling (round up to nearest multiple) ===
 def round_next(now, minutes):
-    """Round current time up to nearest multiple of `minutes`."""
     discard = timedelta(minutes=now.minute % minutes,
                         seconds=now.second,
                         microseconds=now.microsecond)
@@ -97,7 +156,8 @@ def round_next(now, minutes):
 
 # === MAIN LOOP ===
 if __name__ == "__main__":
-    print("🚀 Bot started — monitoring BTCUSDT on 45m, 1h, and 4h...")
+    log("Bot start — monitoring BTCUSDT on 45m (synthetic), 1h, 4h")
+    assert_env()
 
     next_45m = round_next(datetime.now(), 45)
     next_1h = round_next(datetime.now(), 60)
@@ -105,51 +165,49 @@ if __name__ == "__main__":
 
     while True:
         now = datetime.now()
-
         # --- 45m synthetic ---
         if now >= next_45m:
             try:
-                df45 = get_synthetic_45m_series()
-                latest45 = df45.iloc[-2]  # last closed synthetic candle
-                closes45 = df45['close'].tolist()
-                ema45 = get_ema(closes45)
-                check_signal("45 MIN", latest45, ema45)
+                df45 = get_synthetic_45m_df()
+                if df45 is not None:
+                    latest45 = df45.iloc[-2]  # last CLOSED synthetic candle
+                    closes45 = df45['close'].tolist()
+                    ema45 = ema_last_closed(closes45, period=5)
+                    check_signal("45 MIN", latest45, ema45)
             except Exception as e:
-                print("⚠️ 45m error:", e)
+                warn(f"45m block error: {e}")
             next_45m = round_next(now, 45)
 
         # --- 1h ---
         if now >= next_1h:
             try:
-                candles1h = client.get_klines(symbol=SYMBOL, interval=Client.KLINE_INTERVAL_1HOUR, limit=50)
-                latest1h = candles1h[-2]
-                candle = {
-                    'ts': datetime.fromtimestamp(latest1h[0]/1000),
-                    'high': float(latest1h[2]),
-                    'low': float(latest1h[3])
-                }
-                closes1h = [float(c[4]) for c in candles1h]
-                ema1h = get_ema(closes1h)
-                check_signal("1 HOUR", candle, ema1h)
+                data1h = fetch_klines(Client.KLINE_INTERVAL_1HOUR, limit=60)
+                if data1h:
+                    latest1h = data1h[-2]  # closed candle
+                    ts = datetime.fromtimestamp(latest1h[0]/1000)
+                    candle1h = {'ts': ts, 'high': float(latest1h[2]), 'low': float(latest1h[3])}
+                    closes1h = [float(c[4]) for c in data1h]
+                    ema1h = ema_last_closed(closes1h, period=5)
+                    check_signal("1 HOUR", candle1h, ema1h)
             except Exception as e:
-                print("⚠️ 1h error:", e)
+                warn(f"1h block error: {e}")
             next_1h = round_next(now, 60)
 
         # --- 4h ---
         if now >= next_4h:
             try:
-                candles4h = client.get_klines(symbol=SYMBOL, interval=Client.KLINE_INTERVAL_4HOUR, limit=50)
-                latest4h = candles4h[-2]
-                candle = {
-                    'ts': datetime.fromtimestamp(latest4h[0]/1000),
-                    'high': float(latest4h[2]),
-                    'low': float(latest4h[3])
-                }
-                closes4h = [float(c[4]) for c in candles4h]
-                ema4h = get_ema(closes4h)
-                check_signal("4 HOUR", candle, ema4h)
+                data4h = fetch_klines(Client.KLINE_INTERVAL_4HOUR, limit=60)
+                if data4h:
+                    latest4h = data4h[-2]  # closed candle
+                    ts = datetime.fromtimestamp(latest4h[0]/1000)
+                    candle4h = {'ts': ts, 'high': float(latest4h[2]), 'low': float(latest4h[3])}
+                    closes4h = [float(c[4]) for c in data4h]
+                    ema4h = ema_last_closed(closes4h, period=5)
+                    check_signal("4 HOUR", candle4h, ema4h)
             except Exception as e:
-                print("⚠️ 4h error:", e)
+                warn(f"4h block error: {e}")
             next_4h = round_next(now, 240)
 
         time.sleep(30)
+
+      
