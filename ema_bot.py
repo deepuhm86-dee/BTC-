@@ -37,13 +37,7 @@ def get_ema(candles, period=5):
     return float(ema)
 
 # === SIGNAL CHECK ===
-def check_signal(label, candles):
-    latest = candles[-2]  # last closed candle
-    high = float(latest[2])
-    low = float(latest[3])
-    candle_time = datetime.fromtimestamp(latest[0] / 1000)
-    ema = get_ema(candles)
-
+def check_signal(label, high, low, candle_time, ema):
     print(f"[{datetime.now()}] [{label}] H:{high:.2f} L:{low:.2f} EMA5:{ema:.2f}")
 
     # SELL
@@ -73,9 +67,28 @@ def check_signal(label, candles):
     else:
         print(f"❌ No signal on {label}")
 
+# === SYNTHETIC 45m CANDLE ===
+def get_synthetic_45m():
+    candles_15m = client.get_klines(symbol=SYMBOL, interval=Client.KLINE_INTERVAL_15MINUTE, limit=6)
+    if len(candles_15m) < 4:
+        print("⚠️ Not enough 15m candles for 45m synthesis")
+        return None, None, None, None
+
+    batch = candles_15m[-4:-1]  # last 3 closed 15m candles
+    open_price = float(batch[0][1])
+    high_price = max(float(c[2]) for c in batch)
+    low_price = min(float(c[3]) for c in batch)
+    close_price = float(batch[-1][4])
+    candle_time = datetime.fromtimestamp(batch[0][0] / 1000)
+
+    closes = [float(c[4]) for c in candles_15m]
+    ema = get_ema(candles_15m)
+
+    return high_price, low_price, candle_time, ema
+
 # === MAIN LOOP ===
 if __name__ == "__main__":
-    print("🚀 Bot started — monitoring BTCUSDT on 45m, 1h, and 4h...")
+    print("🚀 Bot started — monitoring BTCUSDT on 45m (synthetic), 1h, and 4h...")
 
     next_45m = datetime.now()
     next_1h = datetime.now()
@@ -84,29 +97,42 @@ if __name__ == "__main__":
     while True:
         now = datetime.now()
 
-        # --- 45m ---
+        # --- 45m synthetic ---
         if now >= next_45m:
             try:
-                candles_45m = client.get_klines(symbol=SYMBOL, interval=Client.KLINE_INTERVAL_45MINUTE, limit=50)
-                check_signal("45 MIN", candles_45m)
+                high, low, candle_time, ema = get_synthetic_45m()
+                if ema:
+                    check_signal("45 MIN", high, low, candle_time, ema)
             except Exception as e:
                 print("⚠️ 45m error:", e)
             next_45m += timedelta(minutes=45)
 
-        # --- 1h ---
+        # --- 1h native ---
         if now >= next_1h:
             try:
                 candles_1h = client.get_klines(symbol=SYMBOL, interval=Client.KLINE_INTERVAL_1HOUR, limit=50)
-                check_signal("1 HOUR", candles_1h)
+                latest = candles_1h[-2]
+                high = float(latest[2])
+                low = float(latest[3])
+                candle_time = datetime.fromtimestamp(latest[0] / 1000)
+                ema = get_ema(candles_1h)
+                if ema:
+                    check_signal("1 HOUR", high, low, candle_time, ema)
             except Exception as e:
                 print("⚠️ 1h error:", e)
             next_1h += timedelta(hours=1)
 
-        # --- 4h ---
+        # --- 4h native ---
         if now >= next_4h:
             try:
                 candles_4h = client.get_klines(symbol=SYMBOL, interval=Client.KLINE_INTERVAL_4HOUR, limit=50)
-                check_signal("4 HOUR", candles_4h)
+                latest = candles_4h[-2]
+                high = float(latest[2])
+                low = float(latest[3])
+                candle_time = datetime.fromtimestamp(latest[0] / 1000)
+                ema = get_ema(candles_4h)
+                if ema:
+                    check_signal("4 HOUR", high, low, candle_time, ema)
             except Exception as e:
                 print("⚠️ 4h error:", e)
             next_4h += timedelta(hours=4)
