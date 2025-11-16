@@ -10,6 +10,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SYMBOL = 'BTCUSDT'
 DEBUG_MODE = False
+EPSILON = 0.0001  # float-safe buffer
 
 client = Client()
 last_signal_times = {}
@@ -41,7 +42,7 @@ def check_signal(label, high, low, candle_time, ema):
     print(f"[{datetime.now()}] [{label}] H:{high:.2f} L:{low:.2f} EMA5:{ema:.2f}")
 
     # SELL
-    if low > ema and candle_time != last_signal_times.get(f"{label}_SELL"):
+    if low > ema + EPSILON and candle_time != last_signal_times.get(f"{label}_SELL"):
         message = (
             f"🚀 ABOVE 5 EMA SELL Signal\n\n"
             f"TIME FRAME - {label}\n"
@@ -53,7 +54,7 @@ def check_signal(label, high, low, candle_time, ema):
         last_signal_times[f"{label}_SELL"] = candle_time
 
     # BUY
-    elif high < ema and candle_time != last_signal_times.get(f"{label}_BUY"):
+    elif high < ema - EPSILON and candle_time != last_signal_times.get(f"{label}_BUY"):
         message = (
             f"🟢 BELOW 5 EMA BUY Signal\n\n"
             f"TIME FRAME - {label}\n"
@@ -75,13 +76,9 @@ def get_synthetic_45m():
         return None, None, None, None
 
     batch = candles_15m[-4:-1]  # last 3 closed 15m candles
-    open_price = float(batch[0][1])
     high_price = max(float(c[2]) for c in batch)
     low_price = min(float(c[3]) for c in batch)
-    close_price = float(batch[-1][4])
     candle_time = datetime.fromtimestamp(batch[0][0] / 1000)
-
-    closes = [float(c[4]) for c in candles_15m]
     ema = get_ema(candles_15m)
 
     return high_price, low_price, candle_time, ema
@@ -138,3 +135,7 @@ if __name__ == "__main__":
             next_4h += timedelta(hours=4)
 
         time.sleep(30)
+
+    
+
+ 
