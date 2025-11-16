@@ -33,7 +33,8 @@ def get_ema(candles, period=5):
     if len(closes) < period + 1:
         return None
     df = pd.DataFrame(closes, columns=["close"])
-    return df.ewm(span=period, adjust=False).mean().iloc[-2][0]  # align with closed candle
+    ema = df["close"].ewm(span=period, adjust=False).mean().iloc[-2]
+    return float(ema)
 
 # === SIGNAL CHECK ===
 def check_signal(label, candles):
@@ -43,7 +44,7 @@ def check_signal(label, candles):
     candle_time = datetime.fromtimestamp(latest[0] / 1000)
     ema = get_ema(candles)
 
-    print(f"[{datetime.now()}] [{label}] H:{high} L:{low} EMA5:{ema:.2f}")
+    print(f"[{datetime.now()}] [{label}] H:{high:.2f} L:{low:.2f} EMA5:{ema:.2f}")
 
     # SELL
     if low > ema and candle_time != last_signal_times.get(f"{label}_SELL"):
